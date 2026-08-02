@@ -14,20 +14,13 @@ import {
   Sparkles,
   ShieldCheck,
   Send,
-  Smile,
   Gift,
   Heart,
-  Flame,
   Volume2,
-  VolumeX,
   Globe,
   Bot,
-  AlertTriangle,
-  Image as ImageIcon,
   CheckCircle,
-  Flag,
-  UserCheck,
-  Zap,
+  Camera,
 } from 'lucide-react';
 import { useAuth } from '../../context/AuthContext';
 import { useSocket } from '../../context/SocketContext';
@@ -41,6 +34,7 @@ interface MessageItem {
 }
 
 interface PeerInfo {
+  id?: string;
   name: string;
   country: string;
   countryCode: string;
@@ -98,20 +92,19 @@ export default function VideoChatStudio() {
   const [camOn, setCamOn] = useState(true);
   const [isScreenSharing, setIsScreenSharing] = useState(false);
   const [bgBlur, setBgBlur] = useState(false);
-  const [noiseGate, setNoiseGate] = useState(true);
-  const [hdMode, setHdMode] = useState(true);
 
   // Chat & Gifts
   const [chatMessages, setChatMessages] = useState<MessageItem[]>([]);
   const [inputMessage, setInputMessage] = useState('');
   const [floatingReactions, setFloatingReactions] = useState<{ id: number; icon: string }[]>([]);
   const [showGiftModal, setShowGiftModal] = useState(false);
-  const [aiSubtitles, setAiSubtitles] = useState<string>('Listening for speech...');
-  const [moderationAlert, setModerationAlert] = useState<string | null>(null);
+  const [aiSubtitles, setAiSubtitles] = useState<string>('Listening for live speech...');
 
   // Video Element Refs
   const localVideoRef = useRef<HTMLVideoElement | null>(null);
+  const remoteVideoRef = useRef<HTMLVideoElement | null>(null);
   const localStreamRef = useRef<MediaStream | null>(null);
+  const peerConnectionRef = useRef<RTCPeerConnection | null>(null);
 
   // Initialize Camera Stream on Mount
   useEffect(() => {
@@ -126,7 +119,7 @@ export default function VideoChatStudio() {
           localVideoRef.current.srcObject = stream;
         }
       } catch (err) {
-        console.warn('Camera access denied or unavailable. Using virtual camera preview.');
+        console.warn('Camera access error or restricted. Please allow camera permissions in browser.');
       }
     }
     initCamera();
@@ -138,30 +131,151 @@ export default function VideoChatStudio() {
     };
   }, []);
 
+  // WebRTC & Socket Signaling Hooks
+  useEffect(() => {
+    if (!socket) return;
+
+    // Handle Match Found via Socket
+    socket.on('match_found', ({ roomId, peer, isInitiator }) => {
+      console.log('✨ Real WebRTC match found:', peer);
+      setCurrentPeer(peer);
+      setIsSearching(false);
+      setIsConnected(true);
+      setAiSubtitles(`"Hello! Connected to ${peer.name} from ${peer.country}! 🌸"`);
+
+      // Initialize WebRTC PeerConnection
+      const pc = new RTCPeerConnection({
+        iceServers: [{ urls: 'stun:stun.l.google.com:19302' }],
+      });
+
+      peerConnectionRef.current = pc;
+
+      // Add local stream tracks to WebRTC
+      if (localStreamRef.current) {
+        localStreamRef.current.getTracks().forEach((track) => {
+          pc.addTrack(track, localStreamRef.current!);
+        });
+      }
+
+      // Handle Remote Stream Track
+      pc.ontrack = (event) => {
+        if (remoteVideoRef.current && event.streams[0]) {
+          remoteVideoRef.current.srcObject = event.streams[0];
+        }
+      };
+
+      // Handle ICE Candidate
+      pc.onicecandidate = (event) => {
+        if (event.candidate) {
+          socket.emit('webrtc_ice_candidate', { roomId, candidate: event.candidate });
+        }
+      };
+
+      if (isInitiator) {
+        pc.createOffer()
+          .then((offer) => pc.setLocalDescription(offer))
+          .then(() => {
+            socket.emit('webrtc_offer', { roomId, offer: pc.localDescription });
+          });
+      }
+    });
+
+    socket.on('webrtc_offer', async ({ offer }) => {
+      if (peerConnectionRef.current) {
+        await peerConnectionRef.current.setRemoteDescription(new RTCSessionDescription(offer));
+        const answer = await peerConnectionRef.current.createAnswer();
+        await peerConnectionRef.current.setLocalDescription(answer);
+        socket.emit('webrtc_answer', { answer: peerConnectionRef.current.localDescription });
+      }
+    });
+
+    socket.on('webrtc_answer', async ({ answer }) => {
+      if (peerConnectionRef.current) {
+        await peerConnectionRef.current.setRemoteDescription(new RTCSessionDescription(answer));
+      }
+    });
+
+    socket.on('webrtc_ice_candidate', async ({ candidate }) => {
+      if (peerConnectionRef.current && candidate) {
+        await peerConnectionRef.current.addIceCandidate(new RTCIceCandidate(candidate));
+      }
+    });
+
+    socket.on('receive_chat_message', ({ senderSocketId, originalText, translatedText }) => {
+      if (senderSocketId !== socket.id) {
+        setChatMessages((prev) => [
+          ...prev,
+          {
+            id: Date.now().toString(),
+            sender: 'peer',
+            text: originalText,
+            translatedText: translatedText ? `[AI Tarjima: ${translatedText}]` : undefined,
+            time: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
+          },
+        ]);
+      }
+    });
+
+    socket.on('peer_left', () => {
+      setIsConnected(false);
+      setCurrentPeer(null);
+    });
+
+    return () => {
+      socket.off('match_found');
+      socket.off('webrtc_offer');
+      socket.off('webrtc_answer');
+      socket.off('webrtc_ice_candidate');
+      socket.off('receive_chat_message');
+      socket.off('peer_left');
+    };
+  }, [socket]);
+
   // Handle START Matchmaking
   const handleStartMatch = () => {
     setIsSearching(true);
     setIsConnected(false);
     setCurrentPeer(null);
 
-    // Simulate match lookup or trigger socket room
-    setTimeout(() => {
-      const peer = SAMPLE_PEERS[Math.floor(Math.random() * SAMPLE_PEERS.length)];
-      setCurrentPeer(peer);
-      setIsSearching(false);
-      setIsConnected(true);
-      setAiSubtitles(`"Hello! Great to connect from ${peer.country}! 🌸"`);
+    if (socket) {
+      socket.emit('join_matchmaking', {
+        userId: user?.id || 'guest',
+        name: user?.name || 'Guest User',
+        username: user?.username || 'guest',
+        gender: user?.gender || 'All',
+        country: user?.country || 'United States',
+        countryCode: user?.countryCode || 'US',
+        targetGender: 'All',
+        targetCountry: 'Global',
+        isPremium: user?.isPremium || false,
+        isVerified: true,
+      });
+    }
 
-      // Add welcome chat message
-      setChatMessages([
-        {
-          id: '1',
-          sender: 'peer',
-          text: `Hey! I'm ${peer.name} from ${peer.country}. How are you doing today?`,
-          translatedText: `[AI Tarjima: Salom! Men ${peer.country}lik ${peer.name}man. Qalaysiz?]`,
-          time: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
-        },
-      ]);
+    // Fallback peer generator for solo testing if no second socket joins in 1.5s
+    setTimeout(() => {
+      if (!isConnected && isSearching) {
+        const peer = SAMPLE_PEERS[Math.floor(Math.random() * SAMPLE_PEERS.length)];
+        setCurrentPeer(peer);
+        setIsSearching(false);
+        setIsConnected(true);
+        setAiSubtitles(`"Hello! Great to connect from ${peer.country}! 🌸"`);
+
+        // Duplicate local stream to remote element for testing display
+        if (remoteVideoRef.current && localStreamRef.current) {
+          remoteVideoRef.current.srcObject = localStreamRef.current;
+        }
+
+        setChatMessages([
+          {
+            id: '1',
+            sender: 'peer',
+            text: `Hey! I am ${peer.name} from ${peer.country}. How are you doing?`,
+            translatedText: `[AI Tarjima: Salom! Men ${peer.country}lik ${peer.name}man. Qalaysiz?]`,
+            time: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
+          },
+        ]);
+      }
     }, 1500);
   };
 
@@ -176,6 +290,9 @@ export default function VideoChatStudio() {
     setIsSearching(false);
     setIsConnected(false);
     setCurrentPeer(null);
+    if (remoteVideoRef.current) {
+      remoteVideoRef.current.srcObject = null;
+    }
   };
 
   // Toggle Camera
@@ -236,23 +353,16 @@ export default function VideoChatStudio() {
     };
 
     setChatMessages((prev) => [...prev, newMsg]);
-    setInputMessage('');
 
-    // Simulate instant response from matched peer
-    setTimeout(() => {
-      if (isConnected) {
-        setChatMessages((prev) => [
-          ...prev,
-          {
-            id: (Date.now() + 1).toString(),
-            sender: 'peer',
-            text: 'That sounds amazing! Loved talking to you ✨',
-            translatedText: '[AI Tarjima: Bu juda zo‘r eshitiladi! Siz bilan gaplashish yoqdi ✨]',
-            time: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
-          },
-        ]);
-      }
-    }, 1200);
+    if (socket) {
+      socket.emit('send_chat_message', {
+        roomId: 'room_1',
+        message: inputMessage,
+        targetLanguage: 'Uzbek',
+      });
+    }
+
+    setInputMessage('');
   };
 
   return (
@@ -270,7 +380,7 @@ export default function VideoChatStudio() {
       <div className="glass-card px-6 py-3 rounded-2xl flex items-center justify-between border border-white/10 shadow-lg">
         <div className="flex items-center gap-4">
           <div className="flex items-center gap-2 text-xs font-black text-purple-400 uppercase tracking-widest">
-            <Video className="w-4 h-4 text-pink-400 animate-pulse" /> HD WebRTC Studio
+            <Video className="w-4 h-4 text-pink-400 animate-pulse" /> HD WebRTC Video Studio
           </div>
           {isConnected && currentPeer && (
             <div className="flex items-center gap-2 px-3 py-1 rounded-xl bg-slate-900 border border-white/10 text-xs font-bold text-slate-200">
@@ -287,28 +397,29 @@ export default function VideoChatStudio() {
             <ShieldCheck className="w-3.5 h-3.5" /> AI Safety Verified
           </div>
           <div className="flex items-center gap-1.5 px-3 py-1 rounded-xl bg-purple-500/10 border border-purple-500/30 text-[11px] font-extrabold text-purple-300">
-            <Bot className="w-3.5 h-3.5" /> Voice Translator Active
+            <Bot className="w-3.5 h-3.5" /> Realtime AI Subtitles
           </div>
         </div>
       </div>
 
-      {/* Main Studio Layout (Dual Videos + Chat Sidebar) */}
+      {/* Main Studio Layout (Dual Real Video Streams + Chat Sidebar) */}
       <div className="flex-grow grid grid-cols-1 lg:grid-cols-4 gap-4 overflow-hidden">
         {/* Video Area (3 Cols) */}
         <div className="lg:col-span-3 flex flex-col space-y-4">
           {/* Dual Screen Display Grid */}
           <div className="flex-grow grid grid-cols-1 md:grid-cols-2 gap-4 rounded-3xl overflow-hidden glass-card p-3 border border-white/10 relative">
-            {/* Peer Remote Video Frame */}
+            {/* Peer Remote Video Stream Frame */}
             <div className="relative rounded-2xl overflow-hidden bg-slate-950 flex flex-col justify-between p-4 border border-white/10 group">
+              <video
+                ref={remoteVideoRef}
+                autoPlay
+                playsInline
+                className={`absolute inset-0 w-full h-full object-cover ${isConnected ? 'opacity-100' : 'opacity-0'}`}
+              />
+              <div className="absolute inset-0 bg-gradient-to-t from-slate-950/90 via-transparent to-slate-950/20 pointer-events-none" />
+
               {isConnected && currentPeer ? (
                 <>
-                  <img
-                    src={currentPeer.avatarUrl}
-                    alt={currentPeer.name}
-                    className="absolute inset-0 w-full h-full object-cover opacity-90 group-hover:scale-105 transition duration-700"
-                  />
-                  <div className="absolute inset-0 bg-gradient-to-t from-slate-950/90 via-transparent to-slate-950/30" />
-
                   <div className="relative z-10 flex items-center justify-between">
                     <div className="px-3 py-1 rounded-full bg-slate-900/80 backdrop-blur-md border border-white/10 text-xs font-bold text-white flex items-center gap-2">
                       <span>{currentPeer.name}</span>
@@ -337,7 +448,7 @@ export default function VideoChatStudio() {
                     <div className="space-y-4">
                       <div className="w-16 h-16 rounded-full border-4 border-purple-500 border-t-transparent animate-spin mx-auto" />
                       <div className="text-lg font-black text-white">Searching for online match...</div>
-                      <div className="text-xs text-purple-400">Filtering by Region & Interests</div>
+                      <div className="text-xs text-purple-400">Connecting WebRTC Peer Stream</div>
                     </div>
                   ) : (
                     <div className="space-y-4">
@@ -365,24 +476,22 @@ export default function VideoChatStudio() {
                   bgBlur ? 'blur-md scale-110' : ''
                 }`}
               />
-              <div className="absolute inset-0 bg-gradient-to-t from-slate-950/90 via-transparent to-slate-950/30 pointer-events-none" />
+              <div className="absolute inset-0 bg-gradient-to-t from-slate-950/90 via-transparent to-slate-950/20 pointer-events-none" />
 
               <div className="relative z-10 flex items-center justify-between">
                 <div className="px-3 py-1 rounded-full bg-slate-900/80 backdrop-blur-md border border-white/10 text-xs font-bold text-white flex items-center gap-1.5">
                   <span className="w-2 h-2 rounded-full bg-emerald-400 animate-pulse" />
-                  <span>You ({user?.name || 'Local Stream'})</span>
+                  <span>You ({user?.name || 'Local Camera Stream'})</span>
                 </div>
 
-                <div className="flex items-center gap-2">
-                  <button
-                    onClick={() => setBgBlur(!bgBlur)}
-                    className={`px-3 py-1 rounded-xl text-xs font-bold transition border ${
-                      bgBlur ? 'bg-purple-600 text-white border-purple-400' : 'bg-slate-900/80 text-slate-300 border-white/10'
-                    }`}
-                  >
-                    Blur BG
-                  </button>
-                </div>
+                <button
+                  onClick={() => setBgBlur(!bgBlur)}
+                  className={`px-3 py-1 rounded-xl text-xs font-bold transition border ${
+                    bgBlur ? 'bg-purple-600 text-white border-purple-400' : 'bg-slate-900/80 text-slate-300 border-white/10'
+                  }`}
+                >
+                  Blur BG
+                </button>
               </div>
 
               {/* Reaction Bar */}
