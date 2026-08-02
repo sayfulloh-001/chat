@@ -5,7 +5,7 @@
   "main": "index.js",
   "scripts": {
     "dev": "concurrently -k -n \"BACKEND,FRONTEND\" -c \"blue,magenta\" \"cd backend && npm run dev\" \"cd frontend && npm run dev\"",
-    "build": "npm run build --prefix backend && npm run build --prefix frontend",
+    "build": "npm run build --prefix frontend",
     "start": "concurrently -k -n \"BACKEND,FRONTEND\" -c \"blue,magenta\" \"cd backend && npm run start\" \"cd frontend && npm run start\"",
     "install:all": "npm install && cd backend && npm install && cd ../frontend && npm install",
     "db:push": "npm run db:push --prefix backend",
